@@ -7,9 +7,7 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
 const DB_FILE = 'db.json';
 
-// =====================
-// 📦 DB
-// =====================
+// ===== DB =====
 if (!fs.existsSync(DB_FILE)) {
   fs.writeFileSync(DB_FILE, JSON.stringify({}));
 }
@@ -17,152 +15,139 @@ if (!fs.existsSync(DB_FILE)) {
 const readDB = () => JSON.parse(fs.readFileSync(DB_FILE));
 const writeDB = (data) => fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 
-// =====================
-// 🧠 Умный парсер даты
-// =====================
-function parseDate(text) {
-  text = text.toLowerCase();
-  const now = new Date();
+// ===== UI =====
+const mainMenu = {
+  reply_markup: {
+    inline_keyboard: [
+      [{ text: '📅 Запланировать', callback_data: 'plan' }],
+      [{ text: '📖 Расписание', callback_data: 'schedule' }],
+      [{ text: '📚 Домашка', callback_data: 'hw' }]
+    ]
+  }
+};
 
-  let date = new Date();
+// ===== STATE =====
+const userState = {}; // память диалога
 
-  if (text.includes('завтра')) {
-    date.setDate(now.getDate() + 1);
-  } else if (text.includes('сегодня')) {
-    // today
+// ===== START =====
+bot.onText(/\/start|\/bot|\/qudema/, (msg) => {
+  bot.sendMessage(msg.chat.id,
+`🤖 Привет! Я помощник
+
+👇 Выбери действие:`,
+    mainMenu
+  );
+});
+
+// ===== CALLBACK =====
+bot.on('callback_query', (query) => {
+  const chatId = query.message.chat.id;
+  const data = query.data;
+
+  let db = readDB();
+  if (!db[chatId]) db[chatId] = { lesson: null, homework: [], lastReminder: null };
+
+  // ===== ПЛАНИРОВАНИЕ =====
+  if (data === 'plan') {
+    userState[chatId] = { step: 'choose_day' };
+
+    bot.sendMessage(chatId,
+`📅 Когда занятие?`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: 'Сегодня', callback_data: 'day_today' }],
+            [{ text: 'Завтра', callback_data: 'day_tomorrow' }]
+          ]
+        }
+      }
+    );
   }
 
-  // дни недели
-  const days = ['воскресенье','понедельник','вторник','среду','четверг','пятницу','субботу'];
-  days.forEach((day, i) => {
-    if (text.includes(day)) {
-      const current = now.getDay();
-      let diff = i - current;
-      if (diff <= 0) diff += 7;
-      date.setDate(now.getDate() + diff);
+  if (data.startsWith('day_')) {
+    const now = new Date();
+    let date = new Date();
+
+    if (data === 'day_tomorrow') {
+      date.setDate(now.getDate() + 1);
     }
-  });
 
-  const timeMatch = text.match(/(\d{1,2})[:.](\d{2})/);
+    userState[chatId] = { step: 'choose_time', date };
 
-  if (timeMatch) {
-    date.setHours(timeMatch[1]);
-    date.setMinutes(timeMatch[2]);
-    date.setSeconds(0);
-    return date;
+    bot.sendMessage(chatId,
+`⏰ Выбери время:`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            ['16:00','17:00','18:00','19:00'].map(t => ({
+              text: t,
+              callback_data: `time_${t}`
+            }))
+          ]
+        }
+      }
+    );
   }
 
-  return null;
-}
+  if (data.startsWith('time_')) {
+    const time = data.replace('time_', '');
+    const state = userState[chatId];
 
-// =====================
-// 🎛️ Кнопки
-// =====================
-function mainMenu() {
-  return {
-    reply_markup: {
-      keyboard: [
-        ['📅 Расписание', '📚 Домашка'],
-        ['➕ Запланировать', '🔁 Перенести']
-      ],
-      resize_keyboard: true
+    if (!state) return;
+
+    const [h, m] = time.split(':');
+
+    state.date.setHours(h);
+    state.date.setMinutes(m);
+
+    db[chatId].lesson = state.date;
+    db[chatId].lastReminder = null;
+
+    writeDB(db);
+
+    bot.sendMessage(chatId,
+`✅ Запланировано:
+${state.date.toLocaleString()}`,
+      mainMenu
+    );
+  }
+
+  // ===== РАСПИСАНИЕ =====
+  if (data === 'schedule') {
+    if (!db[chatId].lesson) {
+      bot.sendMessage(chatId, '❌ Нет занятия', mainMenu);
+    } else {
+      bot.sendMessage(chatId,
+        `📅 ${new Date(db[chatId].lesson).toLocaleString()}`,
+        mainMenu
+      );
     }
-  };
-}
+  }
 
-// =====================
-// 💬 Сообщения
-// =====================
+  // ===== ДОМАШКА =====
+  if (data === 'hw') {
+    if (db[chatId].homework.length === 0) {
+      bot.sendMessage(chatId, '📚 Нет домашки\n\nНапиши: домашка: текст');
+    } else {
+      bot.sendMessage(chatId,
+        '📚 Домашка:\n\n' +
+        db[chatId].homework.map((h, i) => `${i+1}. ${h}`).join('\n')
+      );
+    }
+  }
+
+  bot.answerCallbackQuery(query.id);
+});
+
+// ===== ТЕКСТ =====
 bot.on('message', (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text.toLowerCase();
 
   let db = readDB();
-  if (!db[chatId]) {
-    db[chatId] = {
-      lesson: null,
-      homework: [],
-      lastReminder: null
-    };
-  }
+  if (!db[chatId]) db[chatId] = { lesson: null, homework: [], lastReminder: null };
 
-  // старт
-  if (text === '/start' || text.startsWith('/bot') || text.startsWith('/qudema')) {
-    bot.sendMessage(chatId,
-`🤖 Я твой помощник по занятиям
-
-Я умею:
-📅 вести расписание  
-📚 хранить домашку  
-⏰ напоминать о занятиях  
-
-Просто пиши как удобно:
-"завтра в 18"
-"перенеси на пятницу 17:00"
-"домашка: решить №5"
-`, mainMenu());
-    return;
-  }
-
-  // =====================
-  // 📅 Расписание
-  // =====================
-  if (text.includes('расписание')) {
-    if (!db[chatId].lesson) {
-      bot.sendMessage(chatId, '❌ Пока нет занятия');
-    } else {
-      bot.sendMessage(chatId,
-        `📅 Занятие: ${new Date(db[chatId].lesson).toLocaleString()}`
-      );
-    }
-    return;
-  }
-
-  // =====================
-  // ➕ Планирование
-  // =====================
-  if (text.includes('запланировать') || text.includes('назначь')) {
-    const date = parseDate(text);
-
-    if (!date) {
-      bot.sendMessage(chatId, '❌ Напиши например: "завтра в 18:00"');
-      return;
-    }
-
-    db[chatId].lesson = date;
-    db[chatId].lastReminder = null;
-    writeDB(db);
-
-    bot.sendMessage(chatId,
-      `✅ Запланировано: ${date.toLocaleString()}`
-    );
-    return;
-  }
-
-  // =====================
-  // 🔁 Перенос
-  // =====================
-  if (text.includes('перенеси')) {
-    const date = parseDate(text);
-
-    if (!date) {
-      bot.sendMessage(chatId, '❌ Напиши: "перенеси на пятницу 17:00"');
-      return;
-    }
-
-    db[chatId].lesson = date;
-    db[chatId].lastReminder = null;
-    writeDB(db);
-
-    bot.sendMessage(chatId,
-      `🔁 Перенесено на: ${date.toLocaleString()}`
-    );
-    return;
-  }
-
-  // =====================
-  // 📚 Домашка
-  // =====================
+  // домашка
   if (text.startsWith('домашка')) {
     const hw = text.replace('домашка', '').replace(':', '').trim();
 
@@ -175,25 +160,10 @@ bot.on('message', (msg) => {
     writeDB(db);
 
     bot.sendMessage(chatId, '✅ Добавлено');
-    return;
-  }
-
-  if (text.includes('домашка') || text.includes('показать домашку')) {
-    if (db[chatId].homework.length === 0) {
-      bot.sendMessage(chatId, '📚 Нет домашки');
-    } else {
-      bot.sendMessage(chatId,
-        '📚 Домашка:\n\n' +
-        db[chatId].homework.map((h, i) => `${i + 1}. ${h}`).join('\n')
-      );
-    }
-    return;
   }
 });
 
-// =====================
-// ⏰ Напоминания
-// =====================
+// ===== НАПОМИНАНИЕ =====
 cron.schedule('* * * * *', () => {
   const db = readDB();
 
@@ -205,13 +175,10 @@ cron.schedule('* * * * *', () => {
 
     const diff = (lesson - now) / 60000;
 
-    // напоминание только 1 раз
     if (diff <= 10 && diff > 9) {
       if (data.lastReminder === 'sent') return;
 
-      bot.sendMessage(chatId,
-        `⏰ Через 10 минут занятие!\n\nГотовься 🚀`
-      );
+      bot.sendMessage(chatId, '⏰ Через 10 минут занятие!');
 
       data.lastReminder = 'sent';
       writeDB(db);
@@ -219,4 +186,4 @@ cron.schedule('* * * * *', () => {
   });
 });
 
-console.log('🔥 PRO BOT RUNNING');
+console.log('🔥 ULTRA BOT READY');
