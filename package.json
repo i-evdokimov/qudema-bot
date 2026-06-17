@@ -11,10 +11,13 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "dayjs": "^1.11.21",
     "dotenv": "^17.4.2",
     "https-proxy-agent": "^9.0.0",
     "node-cron": "^4.2.1",
     "node-telegram-bot-api": "^0.67.0",
-    "telegraf": "^4.16.3"
+    "telegraf": "^4.16.3",
+    "timezone": "^1.0.23",
+    "utc": "^0.1.0"
   }
 }
