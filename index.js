@@ -1,7 +1,7 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs');
 const cron = require('node-cron');
+const mongoose = require('mongoose');
 
 // ===== TIMEZONE =====
 const dayjs = require('dayjs');
@@ -13,19 +13,26 @@ dayjs.extend(tz);
 
 const TZ = 'Asia/Novosibirsk';
 
+// ===== DB =====
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log('✅ MongoDB подключена'))
+  .catch(err => console.log(err));
+
+const userSchema = new mongoose.Schema({
+  chatId: Number,
+  lesson: String,
+  homework: [String],
+  wishes: [String],
+  reminders: [Number],
+  lastTime: Object
+});
+
+const User = mongoose.model('User', userSchema);
+
 // ===== BOT =====
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-const DB_FILE = 'db.json';
-
-if (!fs.existsSync(DB_FILE)) {
-  fs.writeFileSync(DB_FILE, JSON.stringify({}));
-}
-
-const readDB = () => JSON.parse(fs.readFileSync(DB_FILE));
-const writeDB = (data) => fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-
-const userState = {};
+const state = {};
 
 // ===== HELPERS =====
 function nowNSK() {
@@ -62,45 +69,38 @@ function timeButtons() {
 }
 
 // ===== START =====
-bot.onText(/\/start|\/bot|\/qudema/, (msg) => {
-  bot.sendMessage(msg.chat.id,
-`🤖 Привет!
-
-👇 Выбери:`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '⚡ Быстро', callback_data: 'fast' }],
-          [{ text: '📅 Запланировать', callback_data: 'plan' }],
-          [{ text: '📖 Расписание', callback_data: 'schedule' }],
-          [{ text: '📚 Домашка', callback_data: 'hw' }],
-          [{ text: '🎯 Желания', callback_data: 'wish' }]
-        ]
-      }
-    }
+bot.onText(/\/start|\/bot|\/qudema/, async (msg) => {
+  await User.findOneAndUpdate(
+    { chatId: msg.chat.id },
+    { chatId: msg.chat.id },
+    { upsert: true }
   );
+
+  bot.sendMessage(msg.chat.id, '👇 Выбери:', {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '⚡ Быстро', callback_data: 'fast' }],
+        [{ text: '📅 Запланировать', callback_data: 'plan' }],
+        [{ text: '📖 Расписание', callback_data: 'schedule' }],
+        [{ text: '📚 Домашка', callback_data: 'hw' }],
+        [{ text: '🎯 Желания', callback_data: 'wish' }]
+      ]
+    }
+  });
 });
 
 // ===== CALLBACK =====
-bot.on('callback_query', (q) => {
+bot.on('callback_query', async (q) => {
   const chatId = q.message.chat.id;
   const data = q.data;
 
-  let db = readDB();
-  if (!db[chatId]) {
-    db[chatId] = {
-      lesson: null,
-      homework: [],
-      wishes: [],
-      reminders: [],
-      lastTime: null
-    };
-  }
+  const user = await User.findOne({ chatId });
 
+  // 📅 план
   if (data === 'plan') {
     const days = getNext7Days();
 
-    bot.sendMessage(chatId, '📅 Выбери день:', {
+    return bot.sendMessage(chatId, '📅 Выбери день:', {
       reply_markup: {
         inline_keyboard: days.map(d => [{
           text: d.label,
@@ -112,140 +112,173 @@ bot.on('callback_query', (q) => {
 
   if (data.startsWith('day_')) {
     const date = dayjs(data.replace('day_', '')).tz(TZ);
-    userState[chatId] = { date };
+    state[chatId] = { date };
 
-    bot.sendMessage(chatId, '⏰ Выбери или введи время:', {
-      reply_markup: {
-        inline_keyboard: timeButtons()
-      }
+    return bot.sendMessage(chatId, '⏰ Выбери или введи время:', {
+      reply_markup: { inline_keyboard: timeButtons() }
     });
   }
 
   if (data === 'custom_time') {
-    userState[chatId].awaitingTime = true;
-    bot.sendMessage(chatId, '✏️ Введи время в формате HH:MM (например 18:30)');
+    state[chatId].awaitingTime = true;
+    return bot.sendMessage(chatId, 'Введи время HH:MM');
   }
 
   if (data.startsWith('time_')) {
-    const time = data.replace('time_', '');
-    setTime(chatId, time);
+    return setTime(chatId, data.replace('time_', ''));
   }
 
+  // 📖 расписание
   if (data === 'schedule') {
-    if (!db[chatId].lesson) {
-      bot.sendMessage(chatId, '❌ Нет занятия');
-    } else {
-      bot.sendMessage(chatId, `📅 ${formatDate(db[chatId].lesson)}`);
-    }
+    if (!user.lesson) return bot.sendMessage(chatId, '❌ Нет занятия');
+    return bot.sendMessage(chatId, `📅 ${formatDate(user.lesson)}`);
   }
 
+  // 📚 домашка (с кнопками)
   if (data === 'hw') {
-    if (!db[chatId].homework.length) {
-      bot.sendMessage(chatId, '📚 Нет домашки\nНапиши: домашка: текст');
-    } else {
-      bot.sendMessage(chatId,
-        db[chatId].homework.map((h, i) => `${i+1}. ${h}`).join('\n')
-      );
+    if (!user.homework.length) {
+      return bot.sendMessage(chatId, 'Нет домашки\nНапиши: домашка: текст');
     }
+
+    user.homework.forEach((h, i) => {
+      bot.sendMessage(chatId, `${i+1}. ${h}`, {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '❌', callback_data: `del_hw_${i}` },
+            { text: '✏️', callback_data: `edit_hw_${i}` }
+          ]]
+        }
+      });
+    });
   }
 
+  // 🎯 желания (с кнопками)
   if (data === 'wish') {
-    if (!db[chatId].wishes.length) {
-      bot.sendMessage(chatId, '🎯 Нет желаний\nНапиши: желание: текст');
-    } else {
-      bot.sendMessage(chatId,
-        db[chatId].wishes.map((w, i) => `${i+1}. ${w}`).join('\n')
-      );
+    if (!user.wishes.length) {
+      return bot.sendMessage(chatId, 'Нет желаний\nНапиши: желание: текст');
     }
+
+    user.wishes.forEach((w, i) => {
+      bot.sendMessage(chatId, `${i+1}. ${w}`, {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '❌', callback_data: `del_w_${i}` },
+            { text: '✏️', callback_data: `edit_w_${i}` }
+          ]]
+        }
+      });
+    });
+  }
+
+  // ❌ удаление
+  if (data.startsWith('del_hw_')) {
+    user.homework.splice(data.split('_')[2], 1);
+    await user.save();
+    return bot.sendMessage(chatId, 'Удалено');
+  }
+
+  if (data.startsWith('del_w_')) {
+    user.wishes.splice(data.split('_')[2], 1);
+    await user.save();
+    return bot.sendMessage(chatId, 'Удалено');
+  }
+
+  // ✏️ редактирование
+  if (data.startsWith('edit_hw_')) {
+    state[chatId] = { type: 'hw', index: data.split('_')[2] };
+    return bot.sendMessage(chatId, 'Введи новый текст');
+  }
+
+  if (data.startsWith('edit_w_')) {
+    state[chatId] = { type: 'wish', index: data.split('_')[2] };
+    return bot.sendMessage(chatId, 'Введи новый текст');
   }
 
   bot.answerCallbackQuery(q.id);
 });
 
 // ===== УСТАНОВКА ВРЕМЕНИ =====
-function setTime(chatId, time) {
-  let db = readDB();
+async function setTime(chatId, time) {
+  const user = await User.findOne({ chatId });
+
   const [h, m] = time.split(':');
+  const date = state[chatId].date.hour(h).minute(m);
 
-  const state = userState[chatId];
-  if (!state) return;
+  user.lesson = date.toISOString();
+  user.lastTime = { h, m };
+  user.reminders = [];
 
-  const date = state.date.hour(h).minute(m);
+  await user.save();
 
-  db[chatId].lesson = date.toISOString();
-  db[chatId].lastTime = { h, m };
-  db[chatId].reminders = [];
-
-  writeDB(db);
-
-  bot.sendMessage(chatId, `✅ Готово:\n${formatDate(date)}`);
+  bot.sendMessage(chatId, `✅ ${formatDate(date)}`);
 }
 
 // ===== TEXT =====
-bot.on('message', (msg) => {
+bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text?.toLowerCase();
 
   if (!text) return;
 
-  let db = readDB();
-  if (!db[chatId]) db[chatId] = { lesson: null, homework: [], wishes: [], reminders: [] };
+  let user = await User.findOne({ chatId });
+  if (!user) user = await User.create({ chatId, homework: [], wishes: [] });
 
-  // кастомное время
-  if (userState[chatId]?.awaitingTime) {
-    const match = text.match(/^([0-2]?\d):([0-5]\d)$/);
+  // редактирование
+  if (state[chatId]) {
+    if (state[chatId].awaitingTime) {
+      const match = text.match(/^([0-2]?\d):([0-5]\d)$/);
+      if (!match) return bot.sendMessage(chatId, 'Ошибка формата');
 
-    if (!match) {
-      bot.sendMessage(chatId, '❌ Неверный формат. Пример: 18:30');
-      return;
+      state[chatId].awaitingTime = false;
+      return setTime(chatId, text);
     }
 
-    userState[chatId].awaitingTime = false;
-    setTime(chatId, text);
-    return;
+    if (state[chatId].type === 'hw') {
+      user.homework[state[chatId].index] = text;
+    }
+
+    if (state[chatId].type === 'wish') {
+      user.wishes[state[chatId].index] = text;
+    }
+
+    await user.save();
+    state[chatId] = null;
+
+    return bot.sendMessage(chatId, '✏️ Обновлено');
   }
 
-  // домашка
+  // добавление
   if (text.startsWith('домашка')) {
-    const hw = text.replace('домашка', '').replace(':', '').trim();
-
-    if (!hw) return bot.sendMessage(chatId, 'Напиши: домашка: текст');
-
-    db[chatId].homework.push(hw);
-    writeDB(db);
-
-    bot.sendMessage(chatId, '✅ Добавлено');
+    const t = text.replace('домашка','').replace(':','').trim();
+    user.homework.push(t);
+    await user.save();
+    return bot.sendMessage(chatId, '✅ добавлено');
   }
 
-  // желания
   if (text.startsWith('желание')) {
-    const wish = text.replace('желание', '').replace(':', '').trim();
-
-    if (!wish) return bot.sendMessage(chatId, 'Напиши: желание: текст');
-
-    db[chatId].wishes.push(wish);
-    writeDB(db);
-
-    bot.sendMessage(chatId, '🎯 Добавлено');
+    const t = text.replace('желание','').replace(':','').trim();
+    user.wishes.push(t);
+    await user.save();
+    return bot.sendMessage(chatId, '🎯 добавлено');
   }
 });
 
 // ===== CRON =====
-cron.schedule('* * * * *', () => {
-  const db = readDB();
+cron.schedule('* * * * *', async () => {
+  const users = await User.find();
 
-  Object.entries(db).forEach(([chatId, data]) => {
-    if (!data.lesson) return;
+  users.forEach(async (user) => {
+    if (!user.lesson) return;
 
     const now = nowNSK();
-    const lesson = dayjs(data.lesson).tz(TZ);
+    const lesson = dayjs(user.lesson).tz(TZ);
 
     const diff = lesson.diff(now, 'minute');
 
     const send = (min) => {
-      if (diff <= min && diff > min - 1 && !data.reminders.includes(min)) {
-        bot.sendMessage(chatId, `⏰ Через ${min} минут занятие`);
-        data.reminders.push(min);
+      if (diff <= min && diff > min - 1 && !user.reminders.includes(min)) {
+        bot.sendMessage(user.chatId, `⏰ Через ${min} минут занятие`);
+        user.reminders.push(min);
       }
     };
 
@@ -253,8 +286,8 @@ cron.schedule('* * * * *', () => {
     send(30);
     send(10);
 
-    writeDB(db);
+    await user.save();
   });
 });
 
-console.log('🚀 BOT UPGRADED');
+console.log('🔥 FULL MONGO BOT READY');
